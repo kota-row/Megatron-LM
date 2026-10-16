@@ -283,7 +283,7 @@ class TestMimoModel:
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
 
     def test_forward_threads_position_ids_to_language_model(self):
-        """Thread token, position, and MTP-mask inputs to the language model.
+        """Thread MIMO-managed inputs and extra language arguments to the language model.
 
         Multimodal RoPE (e.g. Qwen3-VL) consumes ``position_ids`` even when
         the language model receives a pre-combined ``decoder_input``. The main
@@ -298,14 +298,14 @@ class TestMimoModel:
         position_ids = self._make_position_ids()
         loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
 
+        extra = {
+            'auxiliary_features': torch.randn(2, self.hidden_size, device=self.device),
+            'auxiliary_option': 'test',
+        }
         captured = {}
 
         def capture_lm_forward(*args, **kwargs):
-            captured['input_ids'] = kwargs.get('input_ids')
-            captured['position_ids'] = kwargs.get('position_ids')
-            captured['decoder_input'] = kwargs.get('decoder_input')
-            captured['loss_mask'] = kwargs.get('loss_mask')
-            captured['mtp_input_mask'] = kwargs.get('mtp_input_mask')
+            captured.update(kwargs)
             return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
 
         with patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
@@ -314,6 +314,7 @@ class TestMimoModel:
                 position_ids=position_ids,
                 loss_mask=loss_mask,
                 modality_inputs=None,
+                language_model_kwargs=extra,
             )
 
         assert (
@@ -331,6 +332,21 @@ class TestMimoModel:
         for special_token_id in self.special_token_ids.values():
             expected_mtp_input_mask &= input_ids != special_token_id
         torch.testing.assert_close(captured['mtp_input_mask'], expected_mtp_input_mask)
+
+        assert captured['auxiliary_features'] is extra['auxiliary_features']
+        assert captured['auxiliary_option'] == 'test'
+        assert set(extra) == {'auxiliary_features', 'auxiliary_option'}
+
+    def test_forward_rejects_managed_language_arguments(self):
+        """Reject overrides of both ordinary and conditional MIMO-owned arguments."""
+        model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        with pytest.raises(ValueError, match="MIMO-managed arguments:.*cp_batch.*input_ids"):
+            model(
+                input_ids=input_ids,
+                position_ids=self._make_position_ids(),
+                language_model_kwargs={'input_ids': input_ids, 'cp_batch': object()},
+            )
 
     def test_prepare_language_inputs_uses_optional_text_indices(self):
         """Precomputed text positions and the fallback scan must produce the same MTP mask."""
@@ -1091,7 +1107,9 @@ class TestMimoModelNonColocated:
         )
 
         outputs, _ = model(
-            input_ids=input_ids, modality_inputs={"images": {"clip_encoder": {"x": images}}}
+            input_ids=input_ids,
+            modality_inputs={"images": {"clip_encoder": {"x": images}}},
+            language_model_kwargs={"unused_language_option": object()},
         )
         assert isinstance(outputs, dict)
         assert "images" in outputs
@@ -1140,12 +1158,9 @@ class TestMimoModelNonColocated:
         assert captured['loss_mask'] is loss_mask
         assert out_loss_mask is loss_mask
 
-    def test_forward_language_module_non_first_stage_threads_mtp_mask(self):
-        """A non-first PP stage that owns MTP must preserve token IDs and its mask.
-
-        Hidden states arrive through ``set_input_tensor`` while the conditioning
-        token IDs remain available for MTP's shifted embedding lookup.
-        """
+    @pytest.mark.parametrize('first_stage', [True, False])
+    def test_forward_language_module_threads_mtp_and_extra_arguments(self, first_stage):
+        """Preserve MTP metadata and extra arguments on first and later language stages."""
         model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
         model = model.to(self.device)
         model.language_model.mtp_process = True
@@ -1163,6 +1178,15 @@ class TestMimoModelNonColocated:
         loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
         loss_mask[:, : self.seq_len // 2] = 0
 
+        extra = {
+            'auxiliary_features': torch.randn(1, self.hidden_size, device=self.device),
+            'auxiliary_option': 'test',
+        }
+        model.set_input_tensor(
+            {'images': extra['auxiliary_features']}
+            if first_stage
+            else {MIMO_LANGUAGE_MODULE_KEY: hidden_states}
+        )
         captured = {}
 
         def capture_lm_forward(*args, **kwargs):
@@ -1170,25 +1194,29 @@ class TestMimoModelNonColocated:
             return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
 
         with (
-            patch.object(model.role, 'is_first_stage', return_value=False),
+            patch.object(model.role, 'is_first_stage', return_value=first_stage),
             patch.object(model.role, 'is_last_stage', return_value=True),
             patch.object(model.language_model, 'forward', side_effect=capture_lm_forward),
         ):
-            lm_output, _ = model._forward_language_module(
+            lm_output, _ = model(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=None,
                 loss_mask=loss_mask,
                 labels=None,
-                input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
+                language_model_kwargs=extra,
             )
 
         assert captured['input_ids'] is input_ids
-        assert captured['decoder_input'] is None
+        assert (captured['decoder_input'] is not None) is first_stage
         assert captured['loss_mask'] is loss_mask
         assert captured['mtp_input_mask'][0, 1].item() is False
         assert captured['mtp_input_mask'][0, 0].item() is True
         torch.testing.assert_close(captured['position_ids'], position_ids)
+
+        assert captured['auxiliary_features'] is extra['auxiliary_features']
+        assert captured['auxiliary_option'] == 'test'
+        assert set(extra) == {'auxiliary_features', 'auxiliary_option'}
 
 
 class TestMimoModelFanoutHelpers:
