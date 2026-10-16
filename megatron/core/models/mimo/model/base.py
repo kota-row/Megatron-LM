@@ -638,11 +638,15 @@ class MimoModel(MegatronModule):
         cu_seqlens_padded: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
+        language_model_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Forward pass through the multimodal model.
 
         Args:
             input_ids: Input token IDs. Shape: (B, S)
+            language_model_kwargs: Rank-local extra language-model forward arguments.
+                Values are forwarded unchanged, without communication or CP/SP partitioning.
+                Encoder-only ranks ignore them. MIMO-managed argument names are reserved.
             position_ids: Position IDs. Shape: (B, S)
             attention_mask: Attention mask. Shape: (B, S)
             loss_mask: Loss mask. Shape: (B, S)
@@ -687,6 +691,7 @@ class MimoModel(MegatronModule):
                 cu_seqlens_padded=cu_seqlens_padded,
                 max_seqlen=max_seqlen,
                 modality_token_indices=modality_token_indices,
+                language_model_kwargs=language_model_kwargs,
             )
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
@@ -706,6 +711,7 @@ class MimoModel(MegatronModule):
                     cu_seqlens_padded=cu_seqlens_padded,
                     max_seqlen=max_seqlen,
                     modality_token_indices=modality_token_indices,
+                    language_model_kwargs=language_model_kwargs,
                 )
 
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -887,11 +893,31 @@ class MimoModel(MegatronModule):
         )
 
     def _forward_prepared_language_inputs(
-        self, cp_batch: ContextParallelBatch, attention_mask: Optional[torch.Tensor]
+        self,
+        cp_batch: ContextParallelBatch,
+        attention_mask: Optional[torch.Tensor],
+        language_model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Call the language model, including the dual-layout batch when present."""
         batch = cp_batch.get_batch()
         cp_kwargs = {"cp_batch": cp_batch} if len(cp_batch.batches_by_layout) > 1 else {}
+        extra_kwargs = dict(language_model_kwargs or {})
+        reserved = {
+            "input_ids",
+            "position_ids",
+            "attention_mask",
+            "decoder_input",
+            "labels",
+            "loss_mask",
+            "mtp_input_mask",
+            "packed_seq_params",
+            "cp_batch",
+        }
+        conflicts = reserved.intersection(extra_kwargs)
+        if conflicts:
+            raise ValueError(
+                f"language_model_kwargs contains MIMO-managed arguments: {sorted(conflicts)}"
+            )
         return self.language_model(
             input_ids=batch["tokens"],
             position_ids=batch["position_ids"],
@@ -902,6 +928,7 @@ class MimoModel(MegatronModule):
             mtp_input_mask=batch["mtp_input_mask"],
             packed_seq_params=cp_batch.get_packed_seq_params(),
             **cp_kwargs,
+            **extra_kwargs,
         )
 
     def _forward_language_module(
@@ -916,11 +943,13 @@ class MimoModel(MegatronModule):
         cu_seqlens_padded: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
+        language_model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Any, Optional[torch.Tensor]]:
         """Forward pass for language module on this rank.
 
         Args:
             input_ids: Token IDs
+            language_model_kwargs: Extra language-model arguments, already prepared for this rank.
             position_ids: Position IDs
             attention_mask: Attention mask. Must be ``None`` under context parallelism
                 (CP-local hidden states cannot line up with a dense mask); mask via a
@@ -1003,7 +1032,7 @@ class MimoModel(MegatronModule):
                 text_token_indices=(modality_token_indices or {}).get("text"),
             )
             lm_output = self._forward_prepared_language_inputs(
-                cp_batch, attention_mask=attention_mask
+                cp_batch, attention_mask=attention_mask, language_model_kwargs=language_model_kwargs
             )
         else:
             # Non-first stage: receive hidden states from previous LM stage.
@@ -1031,7 +1060,7 @@ class MimoModel(MegatronModule):
                     underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self._forward_prepared_language_inputs(
-                cp_batch, attention_mask=attention_mask
+                cp_batch, attention_mask=attention_mask, language_model_kwargs=language_model_kwargs
             )
 
         loss_mask = cp_batch.get_batch().get("loss_mask")
@@ -1095,6 +1124,7 @@ class MimoModel(MegatronModule):
         cu_seqlens_padded: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
+        language_model_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Forward pass when all modules are on all ranks (no multi-module PP).
 
@@ -1160,7 +1190,9 @@ class MimoModel(MegatronModule):
         )
 
         # 5. Forward pass through language model
-        lm_output = self._forward_prepared_language_inputs(cp_batch, attention_mask=None)
+        lm_output = self._forward_prepared_language_inputs(
+            cp_batch, attention_mask=None, language_model_kwargs=language_model_kwargs
+        )
 
         logger.debug(f"Language model output shape: {lm_output.shape}")
 
